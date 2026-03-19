@@ -10,7 +10,7 @@ Usage:
 
 Examples:
     python EXJOBB_sender.py --test 1080p
-    pythob EXJOBB_sender.py --test voice --dest 192.168.20.10
+    python EXJOBB_sender.py --test voice --dest 192.168.20.10
 """
 import argparse, json, socket, statistics, struct, subprocess, sys, threading, time, multiprocessing
 # high-resolution wall clock
@@ -33,13 +33,13 @@ def inject_timestamp(packet: bytes, send_seq:int, send_time: float) -> bytes:
     
     b0 = packet[0]
     cc = b0 & 0x0F
-    has_ext = (b0 >> 4) & 0x01
+    has_ext_= (b0 >> 4) & 0x01
     hlen = RTP_HEADER_MIN + cc * 4
 
     our_data = struct.pack('!Id', send_seq, send_time)
     our_ext = struct.pack('!HH', EXT_PROFILE_ID,EXT_WORDS) + our_data
 
-    if has_ext:
+    if has_ext_:
         if len(packet) < hlen + 4:
             return packet
         existing_len = struct.unpack_from('!H', packet, hlen + 2)[0]
@@ -54,26 +54,26 @@ def inject_timestamp(packet: bytes, send_seq:int, send_time: float) -> bytes:
 def extract_send_info(packet: bytes) -> tuple:
     # Return send_seq, send_time, rtp_seq, rtp_ts
     if len(packet) < RTP_HEADER_MIN:
-        return None,None,None,None
+        return None,None,None,None, None
     
     b0 = packet[0]
     if not ((b0 >> 4)& 0x01):
-        return None,None,None,None
+        return None,None,None,None, None
     
     cc = b0 & 0x0F
     hlen = RTP_HEADER_MIN + cc * 4
 
     if len(packet) < hlen + 4:
-        return None,None,None,None
+        return None,None,None,None, None
     
     profile_id = struct.unpack_from('!H', packet, hlen)[0]
     ext_words = struct.unpack_from('!H', packet, hlen + 2)[0]
 
     if profile_id != EXT_PROFILE_ID or ext_words < EXT_WORDS:
-        return None,None,None,None
+        return None,None,None,None, None
     
     if len(packet) < hlen + 4 + 12:
-        return None,None,None,None
+        return None,None,None,None, None
     
     send_seq, send_time = struct.unpack_from('!Id', packet, hlen + 4)
     rtp_seq = struct.unpack_from('!H', packet, 2)[0]
@@ -142,7 +142,52 @@ def check_ffmpeg():
         print("  Download: https://www.gyan.dev/ffmpeg/builds/")
         print("  Add bin\\ to System PATH and restart your terminal.")
         sys.exit(1)
-        
+# Send-side throughput tracker
+class SendMetrics:
+    def __init__(self):
+        self._lock = threading.Lock()
+        self.bytes_log = []
+
+    def record(self, t: float, raw_len: int):
+        with self._lock:
+            self.bytes_log.append((t, raw_len))
+
+    def throughput_kbps(self) -> dict:
+        with self._lock:
+            log = list(self.bytes_log)
+        if len(log) < 2:
+            return {}
+        buckets = []
+        bkt_start = log[0][0]
+        bkt_bytes = 0
+        for t, b in log:
+            bkt_bytes += b
+            if t - bkt_start >= 1.0:
+                buckets.append(bkt_bytes * 8 / (t - bkt_start) / 1000.0)
+                bkt_bytes = 0
+                bkt_start = t
+        if not buckets:
+            return {}
+        std = statistics.stdev(buckets) if len(buckets) > 1 else 0.0
+        return{
+            "mean_kbps":  round(statistics.mean(buckets), 2),
+            "min_kbps":   round(min(buckets), 2),
+            "max_kbps":   round(max(buckets), 2),
+            "stdev_kbps": round(std, 2),
+            "buckets":    buckets,
+        }
+    def current_kbps(self) -> float:
+        with self._lock:
+            log = list(self.bytes_log)
+        if len(log) < 2:
+            return 0.0
+        bkt_start = log[-1][0] - 1.0
+        bkt_bytes = sum(b for t, b in log if t >= bkt_start)
+        elapsed =log[-1][0] - max(log[0][0], bkt_start)
+        if elapsed <= 0:
+            return 0.0
+        return bkt_bytes * 8 / elapsed / 1000.0
+
 #Shared RTT store
 class RttStore:
     def __init__(self):
@@ -195,11 +240,11 @@ class StreamMetrics:
         lost = 0
         max_burst = 0
         burst_count = 0
-        in_burst = False
+        in_burst = False 
         cur_burst = 0
         
         for i in range(1, len(seqs)):
-            gap = (seqs[i] - seqs[i-1]) & 0xFFF
+            gap = (seqs[i] - seqs[i-1]) & 0xFFFF
             if gap == 1:
                 if in_burst:
                     burst_count += 1
@@ -239,7 +284,20 @@ class StreamMetrics:
             "min_kbps":round(min(buckets),2),
             "max_kbps":round(max(buckets),2),
             "stdev_kbps": round(std,2),
+            "buckets": buckets,
         }
+    def current_kbps(self) -> float:
+        with self._lock:
+            log = list(self.bytes_log)
+        if len(log) < 2:
+            return 0.0
+        bkt_start = log[-1][0] - 1.0
+        bkt_bytes = sum(b for t, b in log if t >= bkt_start)
+        elapsed = log[-1][0] - max(log[0][0], bkt_start)
+        if elapsed <= 0:
+            return 0.0
+        return bkt_bytes*8/elapsed/1000.0
+
 def echo_listener_process(echo_port: int, bind_ip: str, rtt_queue: multiprocessing.Queue, stop_event: multiprocessing.Event):
     echo_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     echo_sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 8 * 1024 * 1024)
@@ -271,7 +329,7 @@ def echo_listener_process(echo_port: int, bind_ip: str, rtt_queue: multiprocessi
 
 # Forwarding thread
 
-def forwarding_loop(loopback_sock: socket.socket, out_sock: socket.socket, dest: tuple, stop_event: threading.Event):
+def forwarding_loop(loopback_sock: socket.socket, out_sock: socket.socket, dest: tuple, stop_event: threading.Event, send_metrics: SendMetrics):
     #Receive raw RTP from FFmpeg, inject timestamps, farward to receiver
     send_seq = 0
     sent = 0
@@ -286,6 +344,7 @@ def forwarding_loop(loopback_sock: socket.socket, out_sock: socket.socket, dest:
         send_time = hires_time()
         stamped   = inject_timestamp(data, send_seq, send_time)
         out_sock.sendto(stamped, dest)
+        send_metrics.record(send_time, len(stamped))
         send_seq = (send_seq + 1) & 0xFFFF_FFFF
         sent += 1
 
@@ -303,7 +362,7 @@ def stat_line(values) -> str:
             f"max={max(values):.3f}  "
             f"std={std:.3f} ms")
 
-def save_json(all_rtts: list, metrics: StreamMetrics, path: str, label:str, duration: float):
+def save_json(all_rtts: list, metrics: StreamMetrics, send_metrics: SendMetrics, path: str, label: str, duration: float):
     lost, loss_pct, max_burst, burst_count = metrics.loss_and_bursts()
 
     sorted_rtts = sorted(all_rtts)
@@ -314,29 +373,45 @@ def save_json(all_rtts: list, metrics: StreamMetrics, path: str, label:str, dura
         lo, hi = int(k),min(int(k) + 1, len (sorted_rtts) - 1)
         return round(sorted_rtts[lo] + (sorted_rtts[hi] - sorted_rtts[lo]) * (k - lo), 4)
     
+    tx = send_metrics.throughput_kbps()
+    rx = metrics.throughput_kbps()
+
+    tx_buckets = tx.get("buckets", [])
+    rx_buckets = rx.get("buckets", [])
+    n = min(len(tx_buckets), len(rx_buckets))
+    diff_buckets = [round(tx_buckets[i] - rx_buckets[i], 4) for i in range (n)]
+    avg_diff = round(statistics.mean(diff_buckets), 4) if diff_buckets else None
+    tx_out = {k: v for k, v in tx.items() if k != "buckets"}
+    rx_out = {k: v for k, v in rx.items() if k != "buckets"}
+    
     result = {
         "label":      label,
         "duration_s": round(duration, 3),
         "rtt": {
-            "samples": len(all_rtts),
-            "mean_ms":round(statistics.mean(all_rtts),4) if all_rtts else None,
-            "median_ms":round(statistics.median(all_rtts),4) if all_rtts else None,
-            "min_ms":round(min(all_rtts),4) if all_rtts else None,
-            "max_ms":round(max(all_rtts),4) if all_rtts else None,
-            "stdev_ms":round(statistics.stdev(all_rtts),4) if len(all_rtts) > 1 else None,
-            "p50_ms":percentile(50),
-            "p95_ms":percentile(95),
-            "p99_ms":percentile(99),
+            "samples":   len(all_rtts),
+            "mean_ms":   round(statistics.mean(all_rtts),   4) if all_rtts else None,
+            "median_ms": round(statistics.median(all_rtts), 4) if all_rtts else None,
+            "min_ms":    round(min(all_rtts),               4) if all_rtts else None,
+            "max_ms":    round(max(all_rtts),               4) if all_rtts else None,
+            "stdev_ms":  round(statistics.stdev(all_rtts),  4) if len(all_rtts) > 1 else None,
+            "p50_ms":    percentile(50),
+            "p95_ms":    percentile(95),
+            "p99_ms":    percentile(99),
         },
-        "jitter_ms":round(metrics.jitter_ms(), 4),
+        "jitter_ms": round(metrics.jitter_ms(), 4),
         "packet_loss": {
-            "lost":lost,
-            "loss_pct":loss_pct,
-            "burst_count":burst_count,
-            "max_burst":max_burst,
+            "lost":        lost,
+            "loss_pct":    loss_pct,
+            "burst_count": burst_count,
+            "max_burst":   max_burst,
         },
-        "throughput":metrics.throughput_kbps(),
-        "samples":[round(r, 4) for r in all_rtts],
+        "throughput_sent_kbps":     tx_out,
+        "throughput_received_kbps": rx_out,
+        "throughput_diff": {
+            "avg_diff_kbps": avg_diff,
+            "note": "sent minus received, per 1-second bucket average"
+        },
+        "samples": [round(r, 4) for r in all_rtts],
     }
     with open(path, 'w', encoding='utf-8') as f:
         json.dump(result, f, indent=2)
@@ -392,19 +467,21 @@ def main():
 
     rtt_store = RttStore()
     metrics = StreamMetrics()
+    send_metrics = SendMetrics()
     stop_event = threading.Event()
 
     fwd_thread = threading.Thread(
         target=forwarding_loop,
-        args=(loopback_sock, out_sock, dest, stop_event),
+        args=(loopback_sock, out_sock, dest, stop_event,send_metrics),
         daemon=True
     )
 
     fwd_thread.start()
 
     print("[Sender] threads started. Launching FFmpeg... (60 s, Ctrl+C to stop early)\n")
-    print(f"  {'Elapsed':>7}  {'Echoes':>7}  {'RTT avg':>10}  {'RTT min':>10}  {'RTT max':>10}")
-    print(f"   {'-'*7} {'-'*7} {'-'*10} {'-'*10} {'-'*10}")
+    print(f"  {'Elapsed':>7}  {'Echoes':>7}  {'RTT avg':>10}"
+          f" {'TX kbps':>10}  {'RX kbps':>10}  {'Diff':>10}")
+    print(f"   {'-'*7} {'-'*7} {'-'*10} {'-'*10} {'-'*10} {'-'*10}")
 
     start_time = hires_time()
     last_print = [start_time]
@@ -429,14 +506,18 @@ def main():
             if now - last_print[0] >= 1.0:
                 elapsed = now - start_time
                 all_rtts = rtt_store.snapshot()
+                tx_kbps = send_metrics.current_kbps()
+                rx_kbps = metrics.current_kbps()
+                diff = tx_kbps - rx_kbps
                 if all_rtts:
                     recent = all_rtts[-200:]
                     avg = statistics.mean(recent)
-                    mn, mx = min(recent), max(recent)
                     print(f"  {elapsed:>6.1f}s  {len(all_rtts):>7}  "
-                        f"{avg:>9.3f}ms  {mn:>9.3f}ms  {mx:>9.3f}ms")
+                          f"{avg:>9.3f}ms  "
+                          f"{tx_kbps:>9.1f}  {rx_kbps:>9.1f}  {diff:>+9.1f}")
                 else:
-                    print(f"  {elapsed:>6.1f}s  {'0':>7}  {'(waiting for echo...)':>32}")
+                    print(f"  {elapsed:>6.1f}s  {'0':>7}  {'(waiting for echo...)':>10}  "
+                          f"{tx_kbps:>9.1f}  {'---':>10}  {'---':>10}")
                 last_print[0] = now
     threading.Thread(target=status_printer, daemon=True).start()
 
@@ -470,6 +551,14 @@ def main():
         
         duration = hires_time() - start_time
         all_rtts = rtt_store.snapshot()
+
+        tx = send_metrics.throughput_kbps()
+        rx = metrics.throughput_kbps()
+        tx_buckets = tx.get("buckets", [])
+        rx_buckets = rx.get("buckets", [])
+        n = min(len(tx_buckets), len(rx_buckets))
+        diff_buckets = [tx_buckets[i] - rx_buckets[i] for i in range(n)]
+        avg_diff = statistics.mean(diff_buckets) if diff_buckets else None 
         
         print()
         print("=" * 60)
@@ -484,9 +573,26 @@ def main():
             print(f"  → Is receiver.py running on {args.dest}?")
             print(f"  → Is its firewall open for UDP {dest_port} (in) and {echo_port} (out)?")
         print()
+        print("  THROUGHPUT SUMMARY  (RTP-layer, kbps)")
+        print(f"  {'':20}  {'Mean':>10}  {'Min':>10}  {'Max':>10}  {'Stdev':>10}")
+        print(f"  {'-'*20}  {'-'*10}  {'-'*10}  {'-'*10}  {'-'*10}")
+        if tx:
+            print(f"  {'Sent (TX)':20}  {tx['mean_kbps']:>10.1f}  "
+                  f"{tx['min_kbps']:>10.1f}  {tx['max_kbps']:>10.1f}  "
+                  f"{tx['stdev_kbps']:>10.1f}")
+        if rx:
+            print(f"  {'Received (RX)':20}  {rx['mean_kbps']:>10.1f}  "
+                  f"{rx['min_kbps']:>10.1f}  {rx['max_kbps']:>10.1f}  "
+                  f"{rx['stdev_kbps']:>10.1f}")
+        if avg_diff is not None:
+            print(f"\n  Avg TX−RX diff  : {avg_diff:+.2f} kbps  "
+                  f"({'TX higher — packets dropped in network' if avg_diff > 0 else 'RX higher — timing artefact'})")
+        else:
+            print("\n  Avg TX−RX diff  :n/a (insufficient data)")
+        print()
 
         if all_rtts:
-            save_json(all_rtts, metrics, args.output, label, duration)
+            save_json(all_rtts, metrics, send_metrics, args.output, label, duration)
 
         print("[Sender] Done.")
 
